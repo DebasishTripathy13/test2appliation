@@ -11,6 +11,9 @@ import android.util.Log;
 import org.json.JSONObject;
 import org.vosk.Model;
 import org.vosk.Recognizer;
+import org.vosk.android.RecognitionListener;
+import org.vosk.android.SpeechService;
+import org.vosk.android.StorageService;
 
 import java.io.File;
 import java.io.FileOutputStream;
@@ -18,153 +21,127 @@ import java.io.IOException;
 import java.io.InputStream;
 import java.io.OutputStream;
 
-public class VoskTranscriptionService {
+/**
+ * Vosk-based Hindi speech recognition service.
+ * Fine-tuned for accurate Hindi transcription.
+ */
+public class VoskTranscriptionService implements RecognitionListener {
 
     private static final String TAG = "VoskTranscription";
-    private static final int SAMPLE_RATE = 16000;
-    
+    private static final float SAMPLE_RATE = 16000.0f;
+    private static final String MODEL_PATH = "model-hi";
+
     private Context context;
     private Model model;
-    private Recognizer recognizer;
-    private AudioRecord audioRecord;
-    private Thread recognitionThread;
-    private boolean isRecording = false;
+    private SpeechService speechService;
     private boolean isModelReady = false;
-    
+    private boolean isListening = false;
+
     private TranscriptionListener listener;
+    private StringBuilder currentTranscription = new StringBuilder();
 
     public interface TranscriptionListener {
         void onPartialResult(String text);
         void onFinalResult(String text);
         void onError(String error);
+        void onRecordingComplete(String transcription);
         void onModelReady();
     }
 
-    public VoskTranscriptionService(Context context) throws IOException {
+    public VoskTranscriptionService(Context context) {
         this.context = context;
         initModel();
     }
 
     private void initModel() {
+        // Initialize Vosk model from assets
+        StorageService.unpack(context, MODEL_PATH, MODEL_PATH,
+            (model) -> {
+                this.model = model;
+                this.isModelReady = true;
+                Log.d(TAG, "Vosk Hindi model loaded successfully");
+                if (listener != null) {
+                    listener.onModelReady();
+                }
+            },
+            (exception) -> {
+                Log.e(TAG, "Failed to load Vosk model", exception);
+                // Try fallback loading from assets directly
+                loadModelFromAssets();
+            }
+        );
+    }
+
+    /**
+     * Fallback method to load model directly from assets.
+     */
+    private void loadModelFromAssets() {
         new Thread(() -> {
             try {
-                // Check if model exists in assets
                 AssetManager assetManager = context.getAssets();
-                String[] assets = assetManager.list("");
-                boolean modelFound = false;
-                
-                if (assets != null) {
-                    for (String asset : assets) {
-                        Log.d(TAG, "Found asset: " + asset);
-                        if (asset.equals("model-hi")) {
-                            modelFound = true;
-                            break;
-                        }
-                    }
-                }
-                
-                if (!modelFound) {
-                    String errorMsg = "Model folder 'model-hi' not found in assets.\n\n" +
-                                    "Please download Vosk Hindi model from:\n" +
-                                    "https://alphacephei.com/vosk/models\n\n" +
-                                    "Extract and place it as:\n" +
-                                    "app/src/main/assets/model-hi/";
+                String[] assets = assetManager.list(MODEL_PATH);
+
+                if (assets == null || assets.length == 0) {
+                    String errorMsg = "Hindi model not found in assets.\n" +
+                            "Please download from: https://alphacephei.com/vosk/models\n" +
+                            "Look for: vosk-model-small-hi-0.22";
                     Log.e(TAG, errorMsg);
                     if (listener != null) {
                         listener.onError(errorMsg);
                     }
                     return;
                 }
-                
-                // Copy model from assets to internal storage
-                File modelDir = new File(context.getFilesDir(), "model-hi");
-                
+
+                // Copy model to internal storage
+                File modelDir = new File(context.getFilesDir(), MODEL_PATH);
                 if (!modelDir.exists()) {
-                    Log.d(TAG, "Copying model from assets to " + modelDir.getAbsolutePath());
-                    copyAssetFolder(assetManager, "model-hi", modelDir.getAbsolutePath());
-                } else {
-                    Log.d(TAG, "Model already exists at " + modelDir.getAbsolutePath());
+                    copyAssetFolder(assetManager, MODEL_PATH, modelDir.getAbsolutePath());
                 }
-                
+
                 // Load the model
-                Log.d(TAG, "Loading model from " + modelDir.getAbsolutePath());
-                this.model = new Model(modelDir.getAbsolutePath());
-                this.recognizer = new Recognizer(model, SAMPLE_RATE);
-                this.isModelReady = true;
-                
-                Log.d(TAG, "Model initialized successfully");
+                model = new Model(modelDir.getAbsolutePath());
+                isModelReady = true;
+                Log.d(TAG, "Vosk Hindi model loaded from assets");
+
                 if (listener != null) {
                     listener.onModelReady();
                 }
-                
+
             } catch (Exception e) {
-                String errorMsg = "Failed to load model: " + e.getMessage() + 
-                                "\n\nPlease ensure:\n" +
-                                "1. Downloaded Vosk Hindi model from:\n   https://alphacephei.com/vosk/models\n" +
-                                "2. Extracted and renamed to 'model-hi'\n" +
-                                "3. Placed in app/src/main/assets/model-hi/\n" +
-                                "4. Contains folders: am/, conf/, graph/";
-                Log.e(TAG, errorMsg, e);
-                this.isModelReady = false;
+                Log.e(TAG, "Error loading model from assets", e);
                 if (listener != null) {
-                    listener.onError(errorMsg);
+                    listener.onError("Failed to load Hindi model: " + e.getMessage());
                 }
             }
         }).start();
     }
-    
+
     private void copyAssetFolder(AssetManager assetManager, String srcPath, String dstPath) throws IOException {
         String[] assets = assetManager.list(srcPath);
-        
+
         if (assets == null || assets.length == 0) {
-            // It's a file, copy it
+            // It's a file
             copyAssetFile(assetManager, srcPath, dstPath);
         } else {
-            // It's a folder, create it and recurse
+            // It's a folder
             File dir = new File(dstPath);
-            if (!dir.exists() && !dir.mkdirs()) {
-                throw new IOException("Failed to create directory: " + dstPath);
+            if (!dir.exists()) {
+                dir.mkdirs();
             }
-            
+
             for (String asset : assets) {
-                String srcSubPath = srcPath + "/" + asset;
-                String dstSubPath = dstPath + "/" + asset;
-                copyAssetFolder(assetManager, srcSubPath, dstSubPath);
+                copyAssetFolder(assetManager, srcPath + "/" + asset, dstPath + "/" + asset);
             }
         }
     }
-    
+
     private void copyAssetFile(AssetManager assetManager, String srcPath, String dstPath) throws IOException {
-        InputStream in = null;
-        OutputStream out = null;
-        
-        try {
-            in = assetManager.open(srcPath);
-            File outFile = new File(dstPath);
-            out = new FileOutputStream(outFile);
-            
+        try (InputStream in = assetManager.open(srcPath);
+             OutputStream out = new FileOutputStream(dstPath)) {
             byte[] buffer = new byte[8192];
             int read;
             while ((read = in.read(buffer)) != -1) {
                 out.write(buffer, 0, read);
-            }
-            
-            Log.d(TAG, "Copied: " + srcPath + " -> " + dstPath);
-        } finally {
-            if (in != null) {
-                try {
-                    in.close();
-                } catch (IOException e) {
-                    Log.e(TAG, "Error closing input stream", e);
-                }
-            }
-            if (out != null) {
-                try {
-                    out.flush();
-                    out.close();
-                } catch (IOException e) {
-                    Log.e(TAG, "Error closing output stream", e);
-                }
             }
         }
     }
@@ -174,324 +151,235 @@ public class VoskTranscriptionService {
     }
 
     public boolean isModelReady() {
-        return isModelReady;
+        return isModelReady && model != null;
     }
 
-    public String transcribeAudioFile(Uri audioUri) throws IOException {
+    /**
+     * Start live recording and transcription.
+     */
+    public void startRecording() {
         if (!isModelReady || model == null) {
-            throw new IOException("Model not ready. Please wait for initialization.");
+            if (listener != null) {
+                listener.onError("Model not ready. Please wait...");
+            }
+            return;
         }
 
-        Log.d(TAG, "Starting transcription of audio file: " + audioUri);
+        if (isListening) {
+            return;
+        }
+
+        try {
+            // Create recognizer with Hindi language settings
+            Recognizer recognizer = new Recognizer(model, SAMPLE_RATE);
+            
+            // Configure for better Hindi recognition
+            recognizer.setMaxAlternatives(3);
+            recognizer.setWords(true);
+
+            // Create speech service
+            speechService = new SpeechService(recognizer, SAMPLE_RATE);
+            speechService.startListening(this);
+            
+            isListening = true;
+            currentTranscription.setLength(0);
+            Log.d(TAG, "Started listening for Hindi speech");
+
+        } catch (Exception e) {
+            Log.e(TAG, "Error starting recording", e);
+            if (listener != null) {
+                listener.onError("Failed to start recording: " + e.getMessage());
+            }
+        }
+    }
+
+    /**
+     * Stop recording and get final transcription.
+     */
+    public void stopRecording() {
+        if (speechService != null) {
+            speechService.stop();
+            speechService.shutdown();
+            speechService = null;
+        }
         
-        // Create a new recognizer for file transcription
-        Recognizer fileRecognizer = new Recognizer(model, SAMPLE_RATE);
-        StringBuilder completeText = new StringBuilder();
+        isListening = false;
         
-        try (InputStream inputStream = context.getContentResolver().openInputStream(audioUri)) {
+        String finalText = currentTranscription.toString().trim();
+        Log.d(TAG, "Stopped listening. Final transcription: " + finalText);
+        
+        if (listener != null) {
+            listener.onRecordingComplete(finalText);
+        }
+    }
+
+    /**
+     * Transcribe an audio file.
+     */
+    public String transcribeAudioFile(Uri audioUri) throws IOException {
+        if (!isModelReady || model == null) {
+            throw new IOException("Model not ready");
+        }
+
+        Log.d(TAG, "Transcribing audio file: " + audioUri);
+        
+        StringBuilder transcription = new StringBuilder();
+        Recognizer recognizer = null;
+
+        try {
+            recognizer = new Recognizer(model, SAMPLE_RATE);
+            recognizer.setMaxAlternatives(3);
+            recognizer.setWords(true);
+
+            InputStream inputStream = context.getContentResolver().openInputStream(audioUri);
             if (inputStream == null) {
                 throw new IOException("Cannot open audio file");
             }
-            
+
             // Skip WAV header if present (44 bytes)
             byte[] header = new byte[44];
-            inputStream.read(header);
+            int headerRead = inputStream.read(header);
             
             // Check if it's a WAV file
-            boolean isWav = header[0] == 'R' && header[1] == 'I' && 
+            boolean isWav = headerRead >= 4 && 
+                           header[0] == 'R' && header[1] == 'I' && 
                            header[2] == 'F' && header[3] == 'F';
-            
+
             if (!isWav) {
-                // Reset stream if not WAV - just process as raw audio
+                // Not a WAV file, need to process differently or reset
                 inputStream.close();
-                return transcribeRawAudio(audioUri, fileRecognizer, completeText);
+                inputStream = context.getContentResolver().openInputStream(audioUri);
             }
-            
-            // Process audio data in chunks
+
+            // Process audio in chunks
             byte[] buffer = new byte[4096];
             int bytesRead;
-            
+
             while ((bytesRead = inputStream.read(buffer)) != -1) {
                 // Convert bytes to shorts (16-bit PCM)
                 short[] audioData = new short[bytesRead / 2];
-                for (int i = 0; i < audioData.length; i++) {
+                for (int i = 0; i < audioData.length && (i * 2 + 1) < bytesRead; i++) {
                     audioData[i] = (short) ((buffer[i * 2 + 1] << 8) | (buffer[i * 2] & 0xFF));
                 }
-                
-                if (fileRecognizer.acceptWaveForm(audioData, audioData.length)) {
-                    String result = fileRecognizer.getResult();
-                    String text = extractTextFromJson(result);
+
+                if (recognizer.acceptWaveForm(audioData, audioData.length)) {
+                    String result = recognizer.getResult();
+                    String text = extractText(result);
                     if (!text.isEmpty()) {
-                        if (completeText.length() > 0) {
-                            completeText.append(" ");
+                        if (transcription.length() > 0) {
+                            transcription.append(" ");
                         }
-                        completeText.append(text);
-                        Log.d(TAG, "Intermediate result: " + text);
+                        transcription.append(text);
                     }
                 }
             }
-            
+
             // Get final result
-            String finalResult = fileRecognizer.getFinalResult();
-            String finalText = extractTextFromJson(finalResult);
+            String finalResult = recognizer.getFinalResult();
+            String finalText = extractText(finalResult);
             if (!finalText.isEmpty()) {
-                if (completeText.length() > 0) {
-                    completeText.append(" ");
+                if (transcription.length() > 0) {
+                    transcription.append(" ");
                 }
-                completeText.append(finalText);
+                transcription.append(finalText);
             }
-            
-            Log.d(TAG, "Complete transcription: " + completeText.toString());
-            
-        } catch (Exception e) {
-            Log.e(TAG, "Error transcribing audio file", e);
-            throw new IOException("Failed to transcribe audio: " + e.getMessage());
+
+            inputStream.close();
+
         } finally {
-            fileRecognizer.close();
-        }
-        
-        return completeText.toString().trim();
-    }
-
-    private String transcribeRawAudio(Uri audioUri, Recognizer fileRecognizer, StringBuilder completeText) throws IOException {
-        try (InputStream inputStream = context.getContentResolver().openInputStream(audioUri)) {
-            byte[] buffer = new byte[4096];
-            int bytesRead;
-            
-            while ((bytesRead = inputStream.read(buffer)) != -1) {
-                short[] audioData = new short[bytesRead / 2];
-                for (int i = 0; i < audioData.length; i++) {
-                    audioData[i] = (short) ((buffer[i * 2 + 1] << 8) | (buffer[i * 2] & 0xFF));
-                }
-                
-                if (fileRecognizer.acceptWaveForm(audioData, audioData.length)) {
-                    String result = fileRecognizer.getResult();
-                    String text = extractTextFromJson(result);
-                    if (!text.isEmpty()) {
-                        if (completeText.length() > 0) {
-                            completeText.append(" ");
-                        }
-                        completeText.append(text);
-                    }
-                }
-            }
-            
-            String finalResult = fileRecognizer.getFinalResult();
-            String finalText = extractTextFromJson(finalResult);
-            if (!finalText.isEmpty()) {
-                if (completeText.length() > 0) {
-                    completeText.append(" ");
-                }
-                completeText.append(finalText);
+            if (recognizer != null) {
+                recognizer.close();
             }
         }
-        
-        return completeText.toString().trim();
+
+        String result = transcription.toString().trim();
+        Log.d(TAG, "Audio file transcription complete: " + result);
+        return result;
     }
 
-    private String extractTextFromJson(String jsonResult) {
+    /**
+     * Extract text from Vosk JSON result.
+     */
+    private String extractText(String jsonResult) {
         try {
             JSONObject obj = new JSONObject(jsonResult);
             return obj.optString("text", "");
         } catch (Exception e) {
-            Log.e(TAG, "Error extracting text from JSON", e);
+            Log.e(TAG, "Error parsing JSON result", e);
             return "";
         }
     }
 
-    private File recordedAudioFile;
-    private FileOutputStream audioOutputStream;
-    private java.util.List<short[]> recordedAudioChunks = new java.util.ArrayList<>();
+    // RecognitionListener callbacks
 
-    public void startRecording() {
-        if (!isModelReady || recognizer == null) {
-            String errorMsg = "Recognizer not initialized. Please wait for model to load.\n\n" +
-                            "If this persists, the model may not be installed correctly.\n" +
-                            "Download from: https://alphacephei.com/vosk/models";
+    @Override
+    public void onPartialResult(String hypothesis) {
+        String text = extractText(hypothesis);
+        if (!text.isEmpty() && listener != null) {
+            listener.onPartialResult(text);
+        }
+    }
+
+    @Override
+    public void onResult(String hypothesis) {
+        String text = extractText(hypothesis);
+        if (!text.isEmpty()) {
+            if (currentTranscription.length() > 0) {
+                currentTranscription.append(" ");
+            }
+            currentTranscription.append(text);
+            
             if (listener != null) {
-                listener.onError(errorMsg);
-            }
-            Log.e(TAG, errorMsg);
-            return;
-        }
-
-        if (isRecording) {
-            return;
-        }
-
-        // Clear previous recording
-        recordedAudioChunks.clear();
-
-        int bufferSize = AudioRecord.getMinBufferSize(SAMPLE_RATE, 
-                AudioFormat.CHANNEL_IN_MONO, 
-                AudioFormat.ENCODING_PCM_16BIT);
-
-        audioRecord = new AudioRecord(
-                MediaRecorder.AudioSource.MIC,
-                SAMPLE_RATE,
-                AudioFormat.CHANNEL_IN_MONO,
-                AudioFormat.ENCODING_PCM_16BIT,
-                bufferSize);
-
-        if (audioRecord.getState() != AudioRecord.STATE_INITIALIZED) {
-            if (listener != null) {
-                listener.onError("Failed to initialize audio recorder. Check microphone permissions.");
-            }
-            return;
-        }
-
-        audioRecord.startRecording();
-        isRecording = true;
-
-        // Record audio in memory for later transcription
-        recognitionThread = new Thread(() -> {
-            short[] buffer = new short[bufferSize];
-            
-            while (isRecording) {
-                int numRead = audioRecord.read(buffer, 0, buffer.length);
-                
-                if (numRead > 0) {
-                    // Store audio data for later transcription
-                    short[] chunk = new short[numRead];
-                    System.arraycopy(buffer, 0, chunk, 0, numRead);
-                    recordedAudioChunks.add(chunk);
-                }
-            }
-            
-            Log.d(TAG, "Recording stopped. Total chunks: " + recordedAudioChunks.size());
-        });
-
-        recognitionThread.start();
-    }
-
-    public void stopRecording() {
-        if (!isRecording) {
-            return;
-        }
-
-        isRecording = false;
-
-        if (recognitionThread != null) {
-            try {
-                recognitionThread.join(1000);
-            } catch (InterruptedException e) {
-                Log.e(TAG, "Error stopping recognition thread", e);
-            }
-        }
-
-        if (audioRecord != null) {
-            audioRecord.stop();
-            audioRecord.release();
-            audioRecord = null;
-        }
-
-        // Now transcribe the recorded audio
-        transcribeRecordedAudio();
-    }
-
-    private void transcribeRecordedAudio() {
-        new Thread(() -> {
-            try {
-                Log.d(TAG, "Starting transcription of recorded audio...");
-                
-                if (recordedAudioChunks.isEmpty()) {
-                    if (listener != null) {
-                        listener.onError("No audio recorded");
-                    }
-                    return;
-                }
-
-                // Create a new recognizer for transcription
-                Recognizer fileRecognizer = new Recognizer(model, SAMPLE_RATE);
-                StringBuilder completeText = new StringBuilder();
-
-                // Process all recorded chunks
-                for (short[] chunk : recordedAudioChunks) {
-                    if (fileRecognizer.acceptWaveForm(chunk, chunk.length)) {
-                        String result = fileRecognizer.getResult();
-                        String text = extractTextFromJson(result);
-                        if (!text.isEmpty()) {
-                            if (completeText.length() > 0) {
-                                completeText.append(" ");
-                            }
-                            completeText.append(text);
-                            Log.d(TAG, "Intermediate result: " + text);
-                        }
-                    }
-                }
-
-                // Get final result
-                String finalResult = fileRecognizer.getFinalResult();
-                String finalText = extractTextFromJson(finalResult);
-                if (!finalText.isEmpty()) {
-                    if (completeText.length() > 0) {
-                        completeText.append(" ");
-                    }
-                    completeText.append(finalText);
-                }
-
-                fileRecognizer.close();
-
-                String fullTranscription = completeText.toString().trim();
-                Log.d(TAG, "Complete transcription: " + fullTranscription);
-
-                if (!fullTranscription.isEmpty() && listener != null) {
-                    listener.onFinalResult(fullTranscription);
-                } else if (listener != null) {
-                    listener.onError("No speech detected in recording");
-                }
-
-                // Clear the recorded chunks
-                recordedAudioChunks.clear();
-
-            } catch (Exception e) {
-                Log.e(TAG, "Error transcribing recorded audio", e);
-                if (listener != null) {
-                    listener.onError("Failed to transcribe: " + e.getMessage());
-                }
-            }
-        }).start();
-    }
-
-    private void processPartialResult(String jsonResult) {
-        try {
-            JSONObject obj = new JSONObject(jsonResult);
-            String text = obj.optString("partial", "");
-            
-            if (!text.isEmpty() && listener != null) {
-                listener.onPartialResult(text);
-            }
-        } catch (Exception e) {
-            Log.e(TAG, "Error processing partial result", e);
-        }
-    }
-
-    private void processFinalResult(String jsonResult) {
-        try {
-            JSONObject obj = new JSONObject(jsonResult);
-            String text = obj.optString("text", "");
-            
-            if (!text.isEmpty() && listener != null) {
                 listener.onFinalResult(text);
             }
-        } catch (Exception e) {
-            Log.e(TAG, "Error processing final result", e);
         }
     }
 
-    public void shutdown() {
-        stopRecording();
-        
-        if (recognizer != null) {
-            recognizer.close();
-            recognizer = null;
+    @Override
+    public void onFinalResult(String hypothesis) {
+        String text = extractText(hypothesis);
+        if (!text.isEmpty()) {
+            if (currentTranscription.length() > 0) {
+                currentTranscription.append(" ");
+            }
+            currentTranscription.append(text);
+            
+            if (listener != null) {
+                listener.onFinalResult(text);
+            }
         }
-        
+    }
+
+    @Override
+    public void onError(Exception exception) {
+        Log.e(TAG, "Recognition error", exception);
+        if (listener != null) {
+            listener.onError("Recognition error: " + exception.getMessage());
+        }
+    }
+
+    @Override
+    public void onTimeout() {
+        Log.d(TAG, "Recognition timeout");
+        stopRecording();
+    }
+
+    /**
+     * Clean up resources.
+     */
+    public void shutdown() {
+        if (speechService != null) {
+            speechService.stop();
+            speechService.shutdown();
+            speechService = null;
+        }
+
         if (model != null) {
             model.close();
             model = null;
         }
-        
+
         isModelReady = false;
+        isListening = false;
     }
 }
